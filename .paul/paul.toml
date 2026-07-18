@@ -1,0 +1,34 @@
+name = "homemate"
+version = "0.0.0"
+status = "active"
+path = "."
+tags = []
+
+[paul]
+version = "1.4"
+source = "https://chrisai.cv/skool"
+
+[milestone]
+name = "v0.1 Portage Windows (pilote GO)"
+version = "0.1.0"
+status = "in_progress"
+phases = 5
+
+[phase]
+number = 1
+name = "Bootstrap & substrat process"
+status = "in_progress"
+plans_completed = 3
+
+[loop]
+position = "APPLY"
+plan = "01-04"
+plan_path = "phases/01-bootstrap-substrat/01-04-PLAN.md"
+
+[satellite]
+groom = true
+
+[stats]
+total_plans = 0
+total_phases = 0
+last_activity = "2026-07-18T00:00:00Z"
