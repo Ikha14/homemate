@@ -11,12 +11,12 @@ const REARM_RETRY_LIMIT = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
 
 let child = null;
 let armStatus = "idle";
-let waiters = new Set();
 let retryTimer = null;
 let retryFailures = 0;
 let launchInFlight = null;
 let restorationInFlight = null;
 let armClose = new WeakMap();
+let armReadiness = new WeakMap();
 
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name]);
@@ -26,30 +26,18 @@ function positiveInteger(name, fallback) {
 
 function setArmStatus(status) {
   armStatus = status;
-  for (const resolve of waiters) resolve(status);
-  waiters.clear();
 }
 
-function readyStatus() {
-  if (armStatus === "armed" || armStatus === "wake" || armStatus === "failed" || armStatus === "external") return armStatus;
-  return "";
-}
-
-function waitForArmReady() {
-  const ready = readyStatus();
-  if (ready) return Promise.resolve(ready);
+function waitForArmReady(armChild) {
+  const readiness = armReadiness.get(armChild);
+  if (!readiness) return Promise.resolve("failed");
   return new Promise((resolve) => {
-    let timer = null;
-    const waiter = (status) => {
-      if (timer) clearTimeout(timer);
-      waiters.delete(waiter);
+    const timer = setTimeout(() => resolve("timeout"), ARM_READY_TIMEOUT_MS);
+    timer.unref();
+    void readiness.then((status) => {
+      clearTimeout(timer);
       resolve(status);
-    };
-    timer = setTimeout(() => {
-      waiters.delete(waiter);
-      resolve("timeout");
-    }, ARM_READY_TIMEOUT_MS);
-    waiters.add(waiter);
+    });
   });
 }
 
@@ -167,18 +155,21 @@ function classifyArmClose(stdout, stderr, code, signal) {
   };
 }
 
-function observeArmOutput(stdout, stderr) {
+function observeArmOutput(stdout, stderr, settleReadiness) {
   const combined = `${stdout}\n${stderr}`;
   if (combined.split(/\r?\n/).some((line) => /^watcher: (?:started|attached)\b/.test(line))) {
     setArmStatus("armed");
+    settleReadiness("armed");
     return;
   }
   if (combined.split(/\r?\n/).some((line) => /^watcher: healthy\b/.test(line))) {
     setArmStatus("external");
+    settleReadiness("external");
     return;
   }
   if (combined.split(/\r?\n/).some((line) => /^watcher: FAILED/.test(line))) {
     setArmStatus("failed");
+    settleReadiness("failed");
   }
 }
 
@@ -303,6 +294,17 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
   let stderr = "";
   let settled = false;
   let resolveClosed = null;
+  let readinessSettled = false;
+  let resolveReadiness = null;
+  const readiness = new Promise((resolve) => {
+    resolveReadiness = resolve;
+  });
+  armReadiness.set(armChild, readiness);
+  const settleReadiness = (status) => {
+    if (readinessSettled) return;
+    readinessSettled = true;
+    resolveReadiness(status);
+  };
   const closed = new Promise((resolveClosedChild) => {
     resolveClosed = resolveClosedChild;
   });
@@ -312,11 +314,11 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
   };
   armChild.stdout.on("data", (chunk) => {
     stdout += chunk.toString();
-    observeArmOutput(stdout, stderr);
+    observeArmOutput(stdout, stderr, settleReadiness);
   });
   armChild.stderr.on("data", (chunk) => {
     stderr += chunk.toString();
-    observeArmOutput(stdout, stderr);
+    observeArmOutput(stdout, stderr, settleReadiness);
   });
   armChild.on("close", (code, signal) => {
     if (settled) return;
@@ -324,6 +326,7 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     resolveClosed();
     releaseChild();
     const classification = classifyArmClose(stdout, stderr, code, signal);
+    settleReadiness(classification.kind === "actionable" ? "wake" : "failed");
     const predecessor = String(armChild.pid ?? "");
     if (classification.kind === "actionable") {
       retryFailures = 0;
@@ -352,6 +355,7 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     settled = true;
     resolveClosed();
     releaseChild();
+    settleReadiness("failed");
     if (restorationInFlight) {
       setArmStatus("failed");
       return;
@@ -364,17 +368,17 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
       String(armChild.pid ?? ""),
     );
   });
+  return armChild;
 }
 
 async function beginArm(paths, sessionID, client, predecessorArmPid) {
-  if (!sessionID) return "skipped";
-  if (!(await isPrimaryRoot(paths.root, paths.home))) return "not-primary";
-  if (!(await sessionOwnsLock(paths))) return "read-only";
-  if (child) return "existing";
-  if (retryTimer) return "retrying";
-  if (!shouldArm(paths)) return "not-needed";
-  spawnArm(paths, sessionID, client, predecessorArmPid);
-  return "spawned";
+  if (!sessionID) return { status: "skipped", armChild: null };
+  if (!(await isPrimaryRoot(paths.root, paths.home))) return { status: "not-primary", armChild: null };
+  if (!(await sessionOwnsLock(paths))) return { status: "read-only", armChild: null };
+  if (child) return { status: "existing", armChild: child };
+  if (retryTimer) return { status: "retrying", armChild: null };
+  if (!shouldArm(paths)) return { status: "not-needed", armChild: null };
+  return { status: "spawned", armChild: spawnArm(paths, sessionID, client, predecessorArmPid) };
 }
 
 function armAttempt(status, armChild, includeArmChild) {
@@ -382,24 +386,23 @@ function armAttempt(status, armChild, includeArmChild) {
 }
 
 async function ensureArm(paths, sessionID, client, predecessorArmPid = "", includeArmChild = false) {
-  let launchStatus = "";
+  let launchResult = null;
   if (!launchInFlight) {
     const launch = beginArm(paths, sessionID, client, predecessorArmPid);
     launchInFlight = launch;
     try {
-      launchStatus = await launch;
+      launchResult = await launch;
     } finally {
       if (launchInFlight === launch) launchInFlight = null;
     }
   } else {
-    launchStatus = await launchInFlight;
+    launchResult = await launchInFlight;
   }
-  if (!child) {
-    if (launchStatus !== "spawned" && launchStatus !== "existing") return armAttempt(launchStatus, null, includeArmChild);
-    return armAttempt(readyStatus() || "idle", null, includeArmChild);
+  const armChild = launchResult.armChild;
+  if (!armChild) {
+    return armAttempt(launchResult.status, null, includeArmChild);
   }
-  const armChild = child;
-  return armAttempt(await waitForArmReady(), armChild, includeArmChild);
+  return armAttempt(await waitForArmReady(armChild), armChild, includeArmChild);
 }
 
 export const FmPrimaryWatchArm = async ({ client, directory, worktree }) => {
