@@ -32,13 +32,16 @@ const extensionVersion = `sha256:${createHash("sha256").update(readFileSync(exte
 const retryBaseMs = positiveInteger("FM_WATCH_REARM_RETRY_BASE_MS", 250);
 const retryMaxMs = positiveInteger("FM_WATCH_REARM_RETRY_MAX_MS", 4000);
 const retryLimit = positiveInteger("FM_WATCH_REARM_RETRY_LIMIT", 5);
+const armReadyTimeoutMs = positiveInteger("FM_PI_ARM_READY_TIMEOUT_MS", 12000);
 
 let child: ChildProcess | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let retryFailures = 0;
 let stopping = false;
 let seq = 0;
+let restoring = false;
 const armReadiness = new WeakMap<ChildProcess, Promise<boolean>>();
+const abandonedChildren = new WeakSet<ChildProcess>();
 
 function positiveInteger(name: string, fallback: number): number {
   const value = Number(process.env[name]);
@@ -151,6 +154,55 @@ export default function (pi: ExtensionAPI) {
     return Math.min(retryMaxMs, retryBaseMs * 2 ** Math.max(0, attempt - 1));
   }
 
+  function waitForRetry(attempt: number): Promise<void> {
+    return new Promise((resolveRetry) => {
+      const timer = setTimeout(resolveRetry, retryDelay(attempt));
+      timer.unref();
+    });
+  }
+
+  function waitForReadiness(armChild: ChildProcess): Promise<boolean> {
+    const readiness = armReadiness.get(armChild);
+    if (!readiness) return Promise.resolve(false);
+    return new Promise((resolveReady) => {
+      const timer = setTimeout(() => resolveReady(false), armReadyTimeoutMs);
+      timer.unref();
+      void readiness.then((ready) => {
+        clearTimeout(timer);
+        resolveReady(ready);
+      });
+    });
+  }
+
+  function abandonArm(armChild: ChildProcess | null): void {
+    if (!armChild) return;
+    abandonedChildren.add(armChild);
+    if (child === armChild) child = null;
+    armChild.kill("SIGTERM");
+  }
+
+  async function restoreAfterActionableClose(predecessorArmPid: string): Promise<string> {
+    let failure = "";
+    for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+      if (stopping) return "";
+      const replacement = startArm(predecessorArmPid);
+      const successorChild = child;
+      if (replacement.ok && successorChild && await waitForReadiness(successorChild)) return "";
+      if (replacement.ok) {
+        failure = "watcher: FAILED - Pi extension could not verify a ready successor watcher";
+        abandonArm(successorChild);
+      } else {
+        failure = /(?:read-only|no live session)/.test(replacement.message)
+          ? `watcher: FAILED - Pi extension cannot restore continuity because this session no longer owns the lock\n${replacement.message}`
+          : `watcher: FAILED - Pi extension could not start the successor watcher cycle\n${replacement.message}`;
+        if (/(?:read-only|no live session)/.test(replacement.message)) break;
+      }
+      if (attempt === retryLimit) break;
+      await waitForRetry(attempt + 1);
+    }
+    return `${failure}\nwatcher: FAILED - Pi extension could not restore watcher continuity after ${retryLimit} retries`;
+  }
+
   function scheduleRetry(message: string, predecessorArmPid: string): void {
     if (stopping || child || retryTimer) return;
     const ownership = lockOwnership();
@@ -238,27 +290,23 @@ export default function (pi: ExtensionAPI) {
       settleReadiness(false);
       releaseChild();
       if (stopping) return;
+      if (abandonedChildren.has(armChild)) return;
       const classification = classifyClose(stdout, stderr, code, signal);
       const predecessor = String(armChild.pid ?? "");
       if (classification.kind === "actionable") {
         retryFailures = 0;
-        const replacement = startArm(predecessor);
-        const successorChild = child;
-        const successorReady = successorChild ? armReadiness.get(successorChild) : null;
-        if (!replacement.ok) {
-          const prefix = /(?:read-only|no live session)/.test(replacement.message)
-            ? "watcher: FAILED - Pi extension cannot restore continuity because this session no longer owns the lock"
-            : "watcher: FAILED - Pi extension could not start the successor watcher cycle";
-          surfaceFailure(`${prefix}\n${replacement.message}`);
-        }
+        restoring = true;
         void (async () => {
-          if (successorReady) await successorReady;
-          await sendWake(classification.message);
+          const failure = await restoreAfterActionableClose(predecessor);
+          restoring = false;
+          if (stopping) return;
+          const message = failure ? `${classification.message}\n\n${failure}` : classification.message;
+          await sendWake(message);
         })().catch(() => {
-          // The successor launch and readiness wait are independent of delivery.
         });
         return;
       }
+      if (restoring) return;
       scheduleRetry(classification.message, predecessor);
     });
     armChild.on("error", (error: Error) => {
@@ -267,6 +315,7 @@ export default function (pi: ExtensionAPI) {
       settleReadiness(false);
       releaseChild();
       if (stopping) return;
+      if (abandonedChildren.has(armChild) || restoring) return;
       scheduleRetry(`watcher: FAILED - Pi extension arm child ${id} failed: ${error.message}`, String(armChild.pid ?? ""));
     });
     return { ok: true, message: `watcher: started Pi extension arm child ${id}` };

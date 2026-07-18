@@ -14,6 +14,8 @@ let waiters = new Set();
 let retryTimer = null;
 let retryFailures = 0;
 let launchInFlight = null;
+let restorationInFlight = null;
+let abandonedChildren = new WeakSet();
 
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name]);
@@ -206,6 +208,42 @@ function retryDelay(attempt) {
   return Math.min(REARM_RETRY_MAX_MS, REARM_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1));
 }
 
+function waitForRetry(attempt) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, retryDelay(attempt));
+    timer.unref();
+  });
+}
+
+function abandonArm(armChild) {
+  if (!armChild) return;
+  abandonedChildren.add(armChild);
+  if (child === armChild) child = null;
+  armChild.kill("SIGTERM");
+}
+
+function restorationFailure(status) {
+  if (status === "read-only") {
+    return "watcher: FAILED - OpenCode cannot restore continuity because this session no longer owns the lock";
+  }
+  return `watcher: FAILED - OpenCode could not verify a ready successor watcher (${status || "idle"})`;
+}
+
+async function restoreAfterActionableClose(paths, sessionID, client, predecessorArmPid) {
+  let failure = "";
+  for (let attempt = 0; attempt <= REARM_RETRY_LIMIT; attempt += 1) {
+    const status = await ensureArm(paths, sessionID, client, predecessorArmPid);
+    if (status === "armed") return "";
+    failure = restorationFailure(status);
+    abandonArm(child);
+    if (status === "read-only" || status === "not-primary" || status === "skipped") break;
+    if (attempt === REARM_RETRY_LIMIT) break;
+    await waitForRetry(attempt + 1);
+  }
+  setArmStatus("failed");
+  return `${failure}\nwatcher: FAILED - OpenCode could not restore watcher continuity after ${REARM_RETRY_LIMIT} retries`;
+}
+
 async function scheduleRetry(paths, sessionID, client, reason, predecessorArmPid) {
   if (child || retryTimer) return;
   if (!(await sessionOwnsLock(paths))) {
@@ -264,22 +302,24 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     if (settled) return;
     settled = true;
     releaseChild();
+    if (abandonedChildren.has(armChild)) return;
     const classification = classifyArmClose(stdout, stderr, code, signal);
     const predecessor = String(armChild.pid ?? "");
     if (classification.kind === "actionable") {
       retryFailures = 0;
       setArmStatus("wake");
-      void ensureArm(paths, sessionID, client, predecessor).then((status) => {
-        if (!["armed", "starting", "wake"].includes(status)) {
-          const reason = status === "read-only"
-            ? "watcher: FAILED - OpenCode cannot restore continuity because this session no longer owns the lock"
-            : `watcher: FAILED - OpenCode could not start the successor watcher cycle (${status})`;
-          surfaceFailure(client, sessionID, reason);
-        }
-        void sendPrompt(client, sessionID, wakePrompt(classification.message)).catch(() => {
-          // Continuity restoration above is independent of prompt delivery.
-        });
+      const restoration = restoreAfterActionableClose(paths, sessionID, client, predecessor);
+      restorationInFlight = restoration;
+      void restoration.then((failure) => {
+        if (restorationInFlight === restoration) restorationInFlight = null;
+        const message = failure ? `${classification.message}\n\n${failure}` : classification.message;
+        return sendPrompt(client, sessionID, wakePrompt(message));
+      }).catch(() => {
       });
+      return;
+    }
+    if (restorationInFlight) {
+      setArmStatus("failed");
       return;
     }
     void scheduleRetry(paths, sessionID, client, classification.message, predecessor);
@@ -288,6 +328,11 @@ function spawnArm(paths, sessionID, client, predecessorArmPid = "") {
     if (settled) return;
     settled = true;
     releaseChild();
+    if (abandonedChildren.has(armChild)) return;
+    if (restorationInFlight) {
+      setArmStatus("failed");
+      return;
+    }
     void scheduleRetry(
       paths,
       sessionID,
