@@ -228,7 +228,7 @@ validate_pr_poll_cleanup() {
     return 1
   fi
   if [ "$(fm_pr_file_device "$quarantine")" != "$state_device" ] \
-    || [ "$(fm_pr_file_mode "$quarantine")" != 700 ]; then
+    || ! fm_pr_file_mode_matches "$quarantine" 700; then
     echo "REFUSED: PR-check quarantine is not on the task state device; preserving task state." >&2
     return 1
   fi
@@ -542,7 +542,7 @@ cleanup_stale_lock_for_safety_check() {
   [ -n "$lock" ] && [ -e "$lock" ] || return 0
 
   echo "teardown: worktree safety check blocked by git lock $lock; waiting ${STALE_WORKTREE_LOCK_RETRY_WAIT_SECS}s and retrying (owning process may be exiting)" >&2
-  sleep "$STALE_WORKTREE_LOCK_RETRY_WAIT_SECS"
+  sleep "$STALE_WORKTREE_LOCK_RETRY_WAIT_SECS" & wait $! || true
 
   if [ ! -e "$lock" ]; then
     echo "teardown: worktree safety check lock cleared on its own; retrying safety checks" >&2
@@ -590,7 +590,7 @@ teardown_treehouse_return() {
   while [ "$attempt" -lt "$max_retries" ]; do
     attempt=$(( attempt + 1 ))
     echo "teardown: $label return failed with transient git lock ($lock_desc); waiting ${TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS}s and retrying ($attempt/${max_retries})" >&2
-    sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS"
+    sleep "$TREEHOUSE_RETURN_LOCK_RETRY_WAIT_SECS" & wait $! || true
 
     if out=$( ( cd "$cd_dir" && treehouse return --force "$dir" ) 2>&1 ); then
       [ -n "$out" ] && printf '%s\n' "$out"

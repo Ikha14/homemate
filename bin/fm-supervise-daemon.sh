@@ -694,7 +694,7 @@ wedge_alarm_run_bounded() {
   pid=$!
   WEDGE_ALARM_NOTIFIER_PID=$pid
   start=$SECONDS
-  while kill -0 "-$pid" 2>/dev/null; do
+  while kill -0 "-$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null; do
     elapsed=$((SECONDS - start))
     if [ "$elapsed" -ge "$timeout" ]; then
       wedge_alarm_stop_active_notifier
@@ -1412,7 +1412,7 @@ fm_super_main() {
     if ! fm_backend_target_exists "$BACKEND" "$TARGET"; then
       log "warn: supervisor target '$TARGET' gone; backing off ${INJECT_FAIL_SLEEP}s, will retry"
       # Flush is pointless with no pane; preserve any buffered escalations.
-      sleep "$INJECT_FAIL_SLEEP"
+      sleep "$INJECT_FAIL_SLEEP" & wait $! || true
       continue
     fi
 
@@ -1433,7 +1433,7 @@ fm_super_main() {
           record_crash
           log "watcher exited rc=$rc reason='$reason'; restarting after ${backoff_secs}s"
           WATCHER_PID=""
-          sleep "$backoff_secs"
+          sleep "$backoff_secs" & wait $! || true
           continue
         fi
         # Non-wake stdout (e.g. a watcher singleton-collision "already running"
@@ -1443,7 +1443,7 @@ fm_super_main() {
         if ! is_wake_reason "$reason"; then
           log "watcher non-wake stdout, idling: $reason"
           WATCHER_PID=""
-          sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
+          sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" & wait $! || true
           continue
         fi
         log "wake: $reason"
@@ -1458,7 +1458,7 @@ fm_super_main() {
     # to detect its exit (the kill -0 above) promptly and run housekeeping often
     # enough that batch flushes, stale rechecks, and the catch-all scan fire on
     # cadence. Gating keeps a large fleet cheap between ticks.
-    sleep 1
+    sleep 1 & wait $! || true
     if [ "$(_file_age "$STATE/.subsuper-last-housekeep")" -ge "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}" ]; then
       _now > "$STATE/.subsuper-last-housekeep"
       housekeeping "$STATE"

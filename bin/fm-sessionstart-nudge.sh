@@ -10,6 +10,8 @@ FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
+# shellcheck source=bin/fm-ps-lib.sh
+. "$SCRIPT_DIR/fm-ps-lib.sh"
 # shellcheck source=bin/fm-gate-refuse-lib.sh
 . "$SCRIPT_DIR/fm-gate-refuse-lib.sh"
 # shellcheck source=bin/fm-primary-scope-lib.sh
@@ -28,7 +30,7 @@ lock_is_in_ancestry() {
   kill -0 "$lock_pid" 2>/dev/null || return 1
   for _ in 1 2 3 4 5 6 7 8; do
     [ "$pid" = "$lock_pid" ] && return 0
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    pid=$(fm_ps_field "$pid" ppid 2>/dev/null || true)
     [ -n "$pid" ] && [ "$pid" -gt 1 ] || return 1
   done
   return 1

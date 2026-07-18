@@ -47,6 +47,7 @@
 # on their own for on-demand reads (fm-peek.sh, fm-crew-state.sh).
 
 FM_BACKEND_SCRIPT=${BASH_SOURCE[0]:-$0}
+. "$(cd "$(dirname "$FM_BACKEND_SCRIPT")" && pwd)/fm-ps-lib.sh"
 FM_BACKEND_LIB_DIR="$(cd "$(dirname "$FM_BACKEND_SCRIPT")" && pwd)"
 unset FM_BACKEND_SCRIPT
 FM_BACKEND_DEFAULT_ROOT="$(cd "$FM_BACKEND_LIB_DIR/.." && pwd)"
@@ -211,14 +212,14 @@ fm_backend_detect_cmux_app_is_ancestor() {
     if [ -n "$cmux_pid" ] && [ "$pid" = "$cmux_pid" ]; then
       return 0
     fi
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || comm=""
+    comm=$(fm_ps_field "$pid" comm 2>/dev/null) || comm=""
     comm="${comm#"${comm%%[![:space:]]*}"}"
     comm="${comm%"${comm##*[![:space:]]}"}"
     [ -n "$comm" ] || return 1
     case "$comm" in
       */cmux.app/Contents/MacOS/cmux) return 0 ;;
     esac
-    ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    ppid=$(fm_ps_field "$pid" ppid 2>/dev/null | tr -d '[:space:]')
     case "$ppid" in ''|*[!0-9]*) return 1 ;; esac
     [ "$ppid" -gt 1 ] || return 1
     pid=$ppid

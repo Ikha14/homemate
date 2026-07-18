@@ -92,6 +92,24 @@ fm_pr_file_mode() {
   fi
 }
 
+# fm_pr_file_mode_matches <path> <mode>: the exact-mode privacy gate. On MSYS
+# chmod is emulated and cannot round-trip (0700 reads back as 644 on default
+# noacl mounts), so every strict mode equality would fail forever; the gate
+# degrades to same-owner there, and the Windows profile-directory ACLs carry
+# the actual privacy boundary for state/.
+case "$(uname -s)" in
+  MSYS*|MINGW*) FM_PR_MSYS=1 ;;
+  *) FM_PR_MSYS=0 ;;
+esac
+fm_pr_file_mode_matches() {
+  local path=$1 mode=$2
+  if [ "$FM_PR_MSYS" -eq 1 ]; then
+    [ "$(stat -c %u "$path" 2>/dev/null)" = "$(id -u)" ]
+  else
+    [ "$(fm_pr_file_mode "$path")" = "$mode" ]
+  fi
+}
+
 fm_pr_file_device() {
   if [ "$(uname)" = Darwin ]; then
     stat -f %d "$1" 2>/dev/null
@@ -137,7 +155,7 @@ fm_pr_sha256() {
 fm_pr_private_file_valid() {
   local path=$1 mode=$2 device=$3
   [ -f "$path" ] && [ ! -L "$path" ] || return 1
-  [ "$(fm_pr_file_mode "$path")" = "$mode" ] || return 1
+  fm_pr_file_mode_matches "$path" "$mode" || return 1
   [ "$(fm_pr_file_device "$path")" = "$device" ] || return 1
   [ "$(fm_pr_file_link_count "$path")" = 1 ]
 }

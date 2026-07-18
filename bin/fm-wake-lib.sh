@@ -2,6 +2,12 @@
 # Shared durable wake queue and portable lock helpers.
 
 FM_WAKE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=bin/fm-ps-lib.sh
+. "$FM_WAKE_LIB_DIR/fm-ps-lib.sh"
+# MSYS `ln -s` degrades to a silent copy, freezing the symlink lock forever
+# (ticket 05): on Windows the lock IS the directory, created atomically with
+# mkdir, and the owner files live inside it. POSIX keeps the symlink protocol.
+FM_LOCK_DIR_MODE=${FM_LOCK_DIR_MODE:-$FM_PS_MSYS}
 FM_WAKE_DEFAULT_ROOT="$(cd "$FM_WAKE_LIB_DIR/.." && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-${FM_ROOT:-$FM_WAKE_DEFAULT_ROOT}}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
@@ -28,12 +34,12 @@ fm_pid_identity() {
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  # Pin LC_ALL=C so lstart's date format is locale-invariant: the identity is
-  # written under one locale but re-read under the machine's ambient locale, which
-  # would otherwise mismatch on a non-C locale (e.g. ko_KR) and reject a live watcher.
-  out=$(LC_ALL=C ps -p "$pid" -o lstart= -o command= 2>/dev/null) || return 1
+  # fm_ps_identity pins LC_ALL=C on the POSIX path so lstart's date format is
+  # locale-invariant, and uses procfs starttime+cmdline on MSYS where ps has
+  # neither -p nor -o (ticket 05).
+  out=$(fm_ps_identity "$pid") || return 1
   [ -n "$out" ] || return 1
-  printf '%s\n' "$out" | sed 's/^[[:space:]]*//'
+  printf '%s\n' "$out"
 }
 
 fm_path_mtime() {
@@ -113,6 +119,10 @@ fm_lock_prepare_owner() {
 
 fm_lock_link_owner() {
   local lockdir=$1 owner
+  if [ "$FM_LOCK_DIR_MODE" -eq 1 ] && [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    printf '%s\n' "$lockdir"
+    return 0
+  fi
   owner=$(readlink "$lockdir" 2>/dev/null) || return 1
   [ -n "$owner" ] || return 1
   case "$owner" in
@@ -123,6 +133,10 @@ fm_lock_link_owner() {
 
 fm_lock_points_to_owner() {
   local lockdir=$1 ownerdir=$2 actual
+  if [ "$FM_LOCK_DIR_MODE" -eq 1 ] && [ -d "$lockdir" ] && [ ! -L "$lockdir" ]; then
+    [ "$ownerdir" = "$lockdir" ]
+    return
+  fi
   actual=$(readlink "$lockdir" 2>/dev/null) || return 1
   [ "$actual" = "$ownerdir" ]
 }
@@ -181,6 +195,21 @@ fm_lock_claim() {
 fm_lock_try_create() {
   local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
   FM_LOCK_OWNER_DIR=
+  if [ "$FM_LOCK_DIR_MODE" -eq 1 ]; then
+    mkdir "$lockdir" 2>/dev/null || return 1
+    if ! fm_lock_prepare_owner "$lockdir"; then
+      fm_lock_clean_known_files "$lockdir"
+      rmdir "$lockdir" 2>/dev/null || true
+      return 1
+    fi
+    if fm_lock_claim_blocked_by_steal "$lockdir" "$allowed_steal_owner"; then
+      fm_lock_clean_known_files "$lockdir"
+      rmdir "$lockdir" 2>/dev/null || true
+      return 1
+    fi
+    FM_LOCK_OWNER_DIR=$lockdir
+    return 0
+  fi
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"

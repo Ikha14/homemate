@@ -35,6 +35,47 @@ cd "$DIR"
 AGENTS=AGENTS.md
 CLAUDE=CLAUDE.md
 
+# On Windows (Git Bash/MSYS) `ln -s` silently degrades to a copy, so the
+# CLAUDE.md convention switches to an explicitly generated copy of AGENTS.md,
+# tagged with a first-line marker so the script can tell its own copies apart
+# from a real human-authored CLAUDE.md and regenerate them when AGENTS.md moves.
+FM_WIN_COPY_MODE=0
+case "$(uname -s)" in
+  MSYS*|MINGW*) FM_WIN_COPY_MODE=1 ;;
+esac
+WIN_COPY_MARKER='<!-- fm: generated copy of AGENTS.md (Windows, no symlink); edit AGENTS.md instead -->'
+
+win_write_copy() {
+  { printf '%s\n' "$WIN_COPY_MARKER"; cat "$AGENTS"; } > "$CLAUDE"
+}
+
+win_copy_is_current() {
+  [ -f "$CLAUDE" ] || return 1
+  [ "$(head -n 1 "$CLAUDE")" = "$WIN_COPY_MARKER" ] || return 1
+  tail -n +2 "$CLAUDE" | cmp -s - "$AGENTS"
+}
+
+# True for our generated copies (fresh or stale) and for a symlink checked out
+# by git as a plain file holding the literal target path (core.symlinks=false).
+win_claude_is_ours() {
+  [ -f "$CLAUDE" ] || return 1
+  if [ "$(head -n 1 "$CLAUDE")" = "$WIN_COPY_MARKER" ]; then
+    return 0
+  fi
+  case "$(cat "$CLAUDE")" in
+    "$AGENTS"|"./$AGENTS") return 0 ;;
+  esac
+  return 1
+}
+
+link_claude() {
+  if [ "$FM_WIN_COPY_MODE" -eq 1 ]; then
+    win_write_copy
+  else
+    ln -s "$AGENTS" "$CLAUDE"
+  fi
+}
+
 write_maintenance_section() {
   cat <<'EOF'
 ## Maintaining this file
@@ -64,7 +105,10 @@ ensure_maintenance_section() {
     return 0
   fi
   local eol=$'\n' sep=''
-  if LC_ALL=C grep -q $'\r$' "$AGENTS"; then
+  # Second probe with -U (binary): the MinGW grep of Git for Windows strips
+  # CRLF before matching, so the anchored probe alone never sees the \r there.
+  if LC_ALL=C grep -q $'\r$' "$AGENTS" ||
+    LC_ALL=C grep -qU $'\r$' "$AGENTS" 2>/dev/null; then
     eol=$'\r\n'
   fi
   if [ -s "$AGENTS" ]; then
@@ -99,8 +143,9 @@ is_correct_claude_symlink() {
     "$AGENTS"|"./$AGENTS") return 0 ;;
   esac
   [ -e "$AGENTS" ] || return 1
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$CLAUDE" "$AGENTS" <<'PY'
+  py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+  if [ -n "$py" ]; then
+    "$py" - "$CLAUDE" "$AGENTS" <<'PY'
 import os
 import sys
 sys.exit(0 if os.path.realpath(sys.argv[1]) == os.path.realpath(sys.argv[2]) else 1)
@@ -155,8 +200,14 @@ if [ -e "$AGENTS" ]; then
   fi
   if [ ! -e "$CLAUDE" ]; then
     ensure_maintenance_section
-    ln -s "$AGENTS" "$CLAUDE"
-    if [ "$MAINT_INJECTED" -eq 1 ]; then
+    link_claude
+    if [ "$FM_WIN_COPY_MODE" -eq 1 ]; then
+      if [ "$MAINT_INJECTED" -eq 1 ]; then
+        echo "updated: added ## Maintaining this file to AGENTS.md and copied CLAUDE.md from AGENTS.md in $DIR"
+      else
+        echo "copied: CLAUDE.md from AGENTS.md in $DIR"
+      fi
+    elif [ "$MAINT_INJECTED" -eq 1 ]; then
       echo "updated: added ## Maintaining this file to AGENTS.md and symlinked CLAUDE.md -> AGENTS.md in $DIR"
     else
       echo "symlinked: CLAUDE.md -> AGENTS.md in $DIR"
@@ -164,6 +215,26 @@ if [ -e "$AGENTS" ]; then
     exit 0
   fi
   if [ -f "$CLAUDE" ]; then
+    # Windows copy mode: a real-file CLAUDE.md that is one of our generated
+    # copies (or a symlink degraded by git into its literal target path, or a
+    # markerless byte-identical copy — what MSYS `ln -s` silently produces) is
+    # the nominal state, not a conflict — refresh it when AGENTS.md moves on.
+    if [ "$FM_WIN_COPY_MODE" -eq 1 ] && { win_claude_is_ours || cmp -s "$CLAUDE" "$AGENTS"; }; then
+      ensure_maintenance_section
+      if win_copy_is_current; then
+        if [ "$MAINT_INJECTED" -eq 1 ]; then
+          # unreachable in practice: injection changes AGENTS.md, copy is stale
+          win_write_copy
+          echo "updated: added ## Maintaining this file to AGENTS.md and refreshed CLAUDE.md copy in $DIR"
+        else
+          echo "unchanged: AGENTS.md with CLAUDE.md copy in $DIR"
+        fi
+      else
+        win_write_copy
+        echo "updated: refreshed CLAUDE.md copy of AGENTS.md in $DIR"
+      fi
+      exit 0
+    fi
     echo "conflict: both AGENTS.md and CLAUDE.md are real files in $DIR; reconcile them manually" >&2
     exit 1
   fi
@@ -183,10 +254,29 @@ fi
 
 if [ -e "$CLAUDE" ]; then
   if [ -f "$CLAUDE" ]; then
+    if [ "$FM_WIN_COPY_MODE" -eq 1 ] && [ "$(head -n 1 "$CLAUDE")" = "$WIN_COPY_MARKER" ]; then
+      # Our copy outlived its source: restore AGENTS.md from it (minus marker).
+      tail -n +2 "$CLAUDE" > "$AGENTS"
+      ensure_maintenance_section
+      win_write_copy
+      echo "promoted: restored AGENTS.md from CLAUDE.md copy in $DIR"
+      exit 0
+    fi
+    if [ "$FM_WIN_COPY_MODE" -eq 1 ] && win_claude_is_ours; then
+      # Degraded symlink blob with no AGENTS.md behind it: start fresh.
+      write_skeleton
+      win_write_copy
+      echo "created: AGENTS.md and CLAUDE.md copy in $DIR"
+      exit 0
+    fi
     mv "$CLAUDE" "$AGENTS"
     ensure_maintenance_section
-    ln -s "$AGENTS" "$CLAUDE"
-    echo "promoted: moved CLAUDE.md to AGENTS.md and symlinked CLAUDE.md -> AGENTS.md in $DIR"
+    link_claude
+    if [ "$FM_WIN_COPY_MODE" -eq 1 ]; then
+      echo "promoted: moved CLAUDE.md to AGENTS.md and copied CLAUDE.md from AGENTS.md in $DIR"
+    else
+      echo "promoted: moved CLAUDE.md to AGENTS.md and symlinked CLAUDE.md -> AGENTS.md in $DIR"
+    fi
     exit 0
   fi
   echo "conflict: CLAUDE.md exists in $DIR but is not a regular file or symlink" >&2
@@ -194,5 +284,9 @@ if [ -e "$CLAUDE" ]; then
 fi
 
 write_skeleton
-ln -s "$AGENTS" "$CLAUDE"
-echo "created: AGENTS.md and CLAUDE.md -> AGENTS.md in $DIR"
+link_claude
+if [ "$FM_WIN_COPY_MODE" -eq 1 ]; then
+  echo "created: AGENTS.md and CLAUDE.md copy in $DIR"
+else
+  echo "created: AGENTS.md and CLAUDE.md -> AGENTS.md in $DIR"
+fi

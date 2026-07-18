@@ -376,8 +376,16 @@ test_lock_paused_mid_acquire_claim_fails_during_steal() {
   lockdir="$state/.contend.lock"
   out=$(FM_LOCK_STALE_AFTER=0 FM_STATE_OVERRIDE="$state" bash -c '
     . "$1"
-    owner=$(fm_lock_owner_dir "$2") || exit 20
-    ln -s "$owner" "$2" || exit 21
+    if [ "${FM_LOCK_DIR_MODE:-0}" -eq 1 ]; then
+      # Directory-lock protocol (Windows): a paused mid-acquire claimant is a
+      # lock directory that exists with no committed pid; its owner dir IS the
+      # lock. Same interleaving, platform-native shape.
+      owner="$2"
+      mkdir "$2" || exit 21
+    else
+      owner=$(fm_lock_owner_dir "$2") || exit 20
+      ln -s "$owner" "$2" || exit 21
+    fi
     fm_lock_try_acquire "$2.steal" || exit 22
     steal_owner=${FM_LOCK_OWNER_DIR:-}
     if fm_lock_claim "$2" "$owner"; then late=won; else late=lost; fi

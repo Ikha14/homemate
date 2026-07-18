@@ -7,6 +7,28 @@ set -u
 
 TMP_ROOT=$(fm_test_tmproot fm-ensure-agents-md)
 
+# On Windows (MSYS) `ln -s` degrades to a copy, so the convention there is a
+# generated real-file copy of AGENTS.md tagged with a first-line marker (see
+# bin/fm-ensure-agents-md.sh). The invariant under test stays "CLAUDE.md
+# follows AGENTS.md"; only its on-disk shape is platform-dependent.
+assert_claude_follows_agents() {
+  local repo=$1 label=$2
+  if [ -L "$repo/CLAUDE.md" ]; then
+    return 0
+  fi
+  case "$(uname -s)" in
+    MSYS*|MINGW*)
+      head -n 1 "$repo/CLAUDE.md" | grep -Fq 'generated copy of AGENTS.md' ||
+        fail "$label (Windows copy lacks generated-copy marker)"
+      tail -n +2 "$repo/CLAUDE.md" | cmp -s - "$repo/AGENTS.md" ||
+        fail "$label (Windows copy diverges from AGENTS.md)"
+      ;;
+    *)
+      fail "$label"
+      ;;
+  esac
+}
+
 test_created_agents_md_includes_self_governance() {
   local repo agents
   repo="$TMP_ROOT/new-project"
@@ -15,7 +37,7 @@ test_created_agents_md_includes_self_governance() {
   agents="$repo/AGENTS.md"
   assert_present "$agents" "AGENTS.md was not created"
   assert_present "$repo/CLAUDE.md" "CLAUDE.md symlink was not created"
-  [ -L "$repo/CLAUDE.md" ] || fail "CLAUDE.md is not a symlink"
+  assert_claude_follows_agents "$repo" "CLAUDE.md is not a symlink"
   assert_grep "## Maintaining this file" "$agents" "self-governance section heading missing"
   assert_grep "Keep this file for knowledge useful to almost every future agent session in this project." "$agents" \
     "self-governance section lost the future-session bar"
@@ -40,7 +62,7 @@ EOF
   "$ROOT/bin/fm-ensure-agents-md.sh" "$repo" >/dev/null 2>&1 || fail "fm-ensure-agents-md.sh failed for CLAUDE.md promotion"
   agents="$repo/AGENTS.md"
   assert_present "$agents" "AGENTS.md was not created during promotion"
-  [ -L "$repo/CLAUDE.md" ] || fail "CLAUDE.md is not a symlink after promotion"
+  assert_claude_follows_agents "$repo" "CLAUDE.md is not a symlink after promotion"
   assert_grep "Run tests with \`make test\`." "$agents" \
     "promotion lost existing CLAUDE.md content"
   count=$(grep -Fc "## Maintaining this file" "$agents")
@@ -80,7 +102,7 @@ test_existing_agents_md_with_symlink_gains_self_governance() {
   assert_grep "## Maintaining this file" "$agents" "existing AGENTS.md did not gain the self-governance section"
   count=$(grep -Fc "## Maintaining this file" "$agents")
   [ "$count" -eq 1 ] || fail "injection wrote $count self-governance sections"
-  [ -L "$repo/CLAUDE.md" ] || fail "CLAUDE.md is no longer a symlink after injection"
+  assert_claude_follows_agents "$repo" "CLAUDE.md is no longer a symlink after injection"
   # Re-run must be a byte-exact no-op reporting unchanged.
   cp "$agents" "$repo/.after-first"
   out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1) \
@@ -100,7 +122,7 @@ test_existing_agents_md_without_claude_gains_section_and_symlink() {
   out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1) \
     || fail "fm-ensure-agents-md.sh failed for existing AGENTS.md without CLAUDE.md"
   assert_contains "$out" "updated:" "injection without CLAUDE.md did not report an update"
-  [ -L "$repo/CLAUDE.md" ] || fail "CLAUDE.md symlink was not created"
+  assert_claude_follows_agents "$repo" "CLAUDE.md symlink was not created"
   assert_grep "Deploy with kubectl." "$agents" "injection dropped existing AGENTS.md content"
   count=$(grep -Fc "## Maintaining this file" "$agents")
   [ "$count" -eq 1 ] || fail "injection wrote $count self-governance sections"
@@ -142,6 +164,17 @@ test_existing_crlf_agents_md_with_section_stays_unchanged() {
   cp "$agents" "$repo/.before"
   out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1) \
     || fail "fm-ensure-agents-md.sh failed on CRLF AGENTS.md with the section"
+  case "$(uname -s)" in
+    MSYS*|MINGW*)
+      # The test's own `ln -s` degraded to a markerless identical copy on MSYS;
+      # the first pass adopts it (marker + refresh) without touching AGENTS.md,
+      # and the second pass must then report unchanged.
+      if printf '%s' "$out" | grep -q 'updated: refreshed CLAUDE.md copy'; then
+        out=$("$ROOT/bin/fm-ensure-agents-md.sh" "$repo" 2>&1) \
+          || fail "fm-ensure-agents-md.sh failed on CRLF adoption re-run"
+      fi
+      ;;
+  esac
   assert_contains "$out" "unchanged:" "complete CRLF AGENTS.md was not reported unchanged"
   cmp -s "$repo/.before" "$agents" \
     || fail "complete CRLF AGENTS.md was modified"
