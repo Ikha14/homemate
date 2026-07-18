@@ -281,6 +281,18 @@ attach_and_wait() {
   done
 }
 
+# shellcheck disable=SC2329 # Invoked indirectly by the signal traps below.
+handle_attached_signal() {
+  local signal=$1 rc=$2
+  trap - HUP TERM INT
+  cycle_log_append "$rc" "$signal" arm-interrupted none
+  exit "$rc"
+}
+
+trap 'handle_attached_signal HUP 129' HUP
+trap 'handle_attached_signal TERM 143' TERM
+trap 'handle_attached_signal INT 130' INT
+
 watch_output_has_wake() {
   local out=$1
   grep -Eq '^(signal:|stale:|check:|heartbeat($|:))' "$out" 2>/dev/null
@@ -371,7 +383,8 @@ handle_arm_signal() {
 }
 
 trap 'handle_arm_signal HUP 129' HUP
-trap 'handle_arm_signal TERM 143' TERM INT
+trap 'handle_arm_signal TERM 143' TERM
+trap 'handle_arm_signal INT 130' INT
 
 child_out=$(mktemp "$STATE/.watch-arm-output.XXXXXX") || {
   echo "watcher: FAILED - no live watcher with a fresh beacon"

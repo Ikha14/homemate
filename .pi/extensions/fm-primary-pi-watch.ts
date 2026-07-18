@@ -218,7 +218,6 @@ export default function (pi: ExtensionAPI) {
     };
     const observeEstablishedArm = (): void => {
       if (/^watcher: (?:started|attached)\b/m.test(`${stdout}\n${stderr}`)) {
-        retryFailures = 0;
         settleReadiness(true);
       }
     };
